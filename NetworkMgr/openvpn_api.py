@@ -667,13 +667,16 @@ def parse_openvpn_config(filepath):
             cfg['route_nopull'] = True
         elif directive == 'route' and len(args) >= 1:
             net_arg = args[0]
-            mask_arg = args[1] if len(args) >= 2 else '255.255.255.255'
-            if '/' in net_arg and len(args) == 1:
+            mask_arg = args[1] if len(args) >= 2 else ''
+            if '/' in net_arg:
                 net_part, plen_part = net_arg.split('/', 1)
-                net_arg = net_part
-                mask_arg = _normalize_ipv4_netmask(plen_part)
+                net_arg = net_part.strip()
+                if not mask_arg:
+                    mask_arg = _normalize_ipv4_netmask(plen_part)
+                else:
+                    mask_arg = _normalize_ipv4_netmask(mask_arg)
             else:
-                mask_arg = _normalize_ipv4_netmask(mask_arg)
+                mask_arg = _normalize_ipv4_netmask(mask_arg or '255.255.255.255')
             cfg['routes'].append({
                 'network': net_arg,
                 'netmask': mask_arg,
@@ -1157,12 +1160,16 @@ def save_openvpn_config(cfg):
     for rt in cfg.get('routes', []):
         net = rt.get('network', '').strip()
         if net:
-            if '/' in net and not rt.get('netmask', '').strip():
+            mask = rt.get('netmask', '').strip()
+            if '/' in net:
                 net_part, plen_part = net.split('/', 1)
                 net = net_part.strip()
-                mask = _normalize_ipv4_netmask(plen_part)
+                if not mask or mask in ('255.255.255.255', '255.255.255.0'):
+                    mask = _normalize_ipv4_netmask(plen_part)
+                else:
+                    mask = _normalize_ipv4_netmask(mask)
             else:
-                mask = _normalize_ipv4_netmask(rt.get('netmask') or '255.255.255.255')
+                mask = _normalize_ipv4_netmask(mask or '255.255.255.255')
             gw = rt.get('gateway', '').strip() or 'vpn_gateway'
             metric = rt.get('metric', '').strip()
             lines.append(f'route {net} {mask} {gw} {metric}'.strip())
@@ -1531,6 +1538,45 @@ def _ensure_tun_module():
             run(['kldload', 'if_tun'], stderr=DEVNULL, check=False)
 
 
+def _sanitize_conf_file_routes(conf_path):
+    """Sanitize OpenVPN configuration file so IPv4 routes do not contain CIDR slashes."""
+    if not conf_path or not os.path.isfile(conf_path):
+        return
+    try:
+        with open(conf_path, 'r', encoding='utf-8', errors='replace') as fh:
+            content = fh.read()
+    except OSError:
+        return
+
+    if not re.search(r'(?m)^\s*route\s+\d+\.\d+\.\d+\.\d+/\d+', content):
+        return
+
+    new_lines = []
+    for line in content.splitlines():
+        m = re.match(r'^(\s*route\s+)(\d+\.\d+\.\d+\.\d+)/(\d+)(.*)$', line)
+        if m:
+            prefix, ip, plen, rest = m.groups()
+            try:
+                mask = str(IPv4Network(f'0.0.0.0/{plen}').netmask)
+            except ValueError:
+                mask = '255.255.255.0'
+            rest_parts = rest.strip().split()
+            if rest_parts and (rest_parts[0].count('.') == 3 or rest_parts[0].isdigit()):
+                rest_parts[0] = mask
+                new_lines.append(f'{prefix}{ip} ' + ' '.join(rest_parts))
+            elif rest_parts:
+                new_lines.append(f'{prefix}{ip} {mask} ' + ' '.join(rest_parts))
+            else:
+                new_lines.append(f'{prefix}{ip} {mask}')
+        else:
+            new_lines.append(line)
+
+    try:
+        _write_secure_file(conf_path, '\n'.join(new_lines) + '\n', 0o600)
+    except OSError:
+        pass
+
+
 def enable_openvpn(profile_id, username=None, password=None, key_password=None, timeout=12):
     """Bring the specified OpenVPN tunnel up and confirm successful connection.
 
@@ -1557,6 +1603,8 @@ def enable_openvpn(profile_id, username=None, password=None, key_password=None, 
 
     if not conf_path:
         return False, f'Configuration for "{profile_id}" was not found.'
+
+    _sanitize_conf_file_routes(conf_path)
 
     if openvpn_status(profile_id) == 'Connected':
         return True, ''

@@ -21,6 +21,7 @@ from NetworkMgr.openvpn_api import (
     CIPHER_OPTIONS,
     OPENVPN_CONFIG_PATH,
     OPENVPN_NOT_INSTALLED_MSG,
+    _normalize_ipv4_netmask,
     default_openvpn_config,
     detect_vpn_file_type,
     is_openvpn_installed,
@@ -1013,13 +1014,30 @@ class VPNConnectionDialog(Gtk.Window):
         return vbox
 
     def _on_ipv4_route_cell_edited(self, _renderer, path, new_text, col_idx):
-        self.ipv4_routes_store[path][col_idx] = new_text.strip()
+        val = new_text.strip()
+        if col_idx == 0 and '/' in val:
+            net_part, plen_part = val.split('/', 1)
+            self.ipv4_routes_store[path][0] = net_part.strip()
+            self.ipv4_routes_store[path][1] = _normalize_ipv4_netmask(plen_part)
+            return
+        if col_idx == 1 and val:
+            val = _normalize_ipv4_netmask(val)
+        self.ipv4_routes_store[path][col_idx] = val
 
     def _on_add_ipv4_route(self, _widget):
         net = self.r4_net_entry.get_text().strip()
         if not net:
             return
-        mask = self.r4_mask_entry.get_text().strip() or '255.255.255.0'
+        mask = self.r4_mask_entry.get_text().strip()
+        if '/' in net:
+            net_part, plen_part = net.split('/', 1)
+            net = net_part.strip()
+            if not mask:
+                mask = _normalize_ipv4_netmask(plen_part)
+            else:
+                mask = _normalize_ipv4_netmask(mask)
+        else:
+            mask = _normalize_ipv4_netmask(mask or '255.255.255.0')
         gw = self.r4_gw_entry.get_text().strip() or 'vpn_gateway'
         metric = self.r4_metric_entry.get_text().strip()
         self.ipv4_routes_store.append([net, mask, gw, metric])
@@ -1653,16 +1671,28 @@ class VPNConnectionDialog(Gtk.Window):
                 self.cfg['ifconfig_local'] = self.ifconfig_local_entry.get_text().strip()
                 self.cfg['ifconfig_remote'] = self.ifconfig_remote_entry.get_text().strip()
                 self.cfg['route_gateway'] = self.route_gw_entry.get_text().strip()
-                self.cfg['routes'] = [
-                    {
-                        'network': row[0].strip(),
-                        'netmask': row[1].strip() or '255.255.255.0',
+                routes = []
+                for row in self.ipv4_routes_store:
+                    r_net = row[0].strip()
+                    r_mask = row[1].strip() or '255.255.255.0'
+                    if not r_net:
+                        continue
+                    if '/' in r_net:
+                        np, pp = r_net.split('/', 1)
+                        r_net = np.strip()
+                        if not r_mask or r_mask in ('255.255.255.255', '255.255.255.0'):
+                            r_mask = _normalize_ipv4_netmask(pp)
+                        else:
+                            r_mask = _normalize_ipv4_netmask(r_mask)
+                    else:
+                        r_mask = _normalize_ipv4_netmask(r_mask)
+                    routes.append({
+                        'network': r_net,
+                        'netmask': r_mask,
                         'gateway': row[2].strip() or 'vpn_gateway',
                         'metric': row[3].strip(),
-                    }
-                    for row in self.ipv4_routes_store
-                    if row[0].strip()
-                ]
+                    })
+                self.cfg['routes'] = routes
 
                 self.cfg['ipv6_method'] = self.ipv6_method_combo.get_active_id() or 'auto'
                 self.cfg['ifconfig_ipv6_local'] = self.ifconfig_ipv6_local_entry.get_text().strip()

@@ -79,6 +79,13 @@ from NetworkMgr.vpn_dialog import (
     VPNConnectionDialog,
     OpenVPNAuthDialog
 )
+from NetworkMgr.logger import (
+    set_verbose,
+    log_info,
+    log_debug,
+    log_warning,
+    log_error
+)
 
 gettext.bindtextdomain('NetworkMgr', '/usr/local/share/locale')
 gettext.textdomain('NetworkMgr')
@@ -199,7 +206,9 @@ class TrayIcon:
         """
         Gtk.main_quit()
 
-    def __init__(self):
+    def __init__(self, verbose=False):
+        if verbose:
+            set_verbose(True)
         self.cardinfo = None
         self.status_icon = Gtk.StatusIcon()
         self.status_icon.set_visible(True)
@@ -723,10 +732,12 @@ class TrayIcon:
             ssid (str): the network name that was clicked.
             wifi_card (str): the interface to connect.
         """
+        log_info(f'[WiFi] Connecting to open network "{ssid}" on interface {wifi_card}')
         self.connect_attempts = 0
         wpa_reconfigure(wifi_card)
         if not ssid_is_saved(ssid, wifi_card) \
                 and save_open_network(ssid, wifi_card) is None:
+            log_error(f'[WiFi] Failed to save open network "{ssid}" on {wifi_card}')
             self.connection_failed(ssid, wifi_card)
             return
         self.start_connection(ssid, None, wifi_card)
@@ -740,11 +751,14 @@ class TrayIcon:
             network (dict): the clicked network's scan record.
             wifi_card (str): the interface to connect.
         """
+        ssid = network.get('ssid', '')
+        log_info(f'[WiFi] Connecting to PSK network "{ssid}" on interface {wifi_card}')
         self.connect_attempts = 0
         if ssid_is_saved(network['ssid'], wifi_card):
             wpa_reconfigure(wifi_card)
             self.start_connection(network['ssid'], network, wifi_card)
         else:
+            log_debug(f'[WiFi] Network "{ssid}" is not saved yet; requesting passphrase from user')
             self.passphrase_dialog(network, wifi_card, False)
 
     def connect_enterprise_network(self, _widget, network, wifi_card):
@@ -756,12 +770,15 @@ class TrayIcon:
             network (dict): the clicked network's scan record.
             wifi_card (str): the interface to connect.
         """
+        ssid = network.get('ssid', '')
+        log_info(f'[WiFi] Connecting to Enterprise (EAP) network "{ssid}" on interface {wifi_card}')
         self.connect_attempts = 0
         if ssid_is_saved(network['ssid'], wifi_card):
             wpa_reconfigure(wifi_card)
             self.start_connection(network['ssid'], network, wifi_card,
                                   enterprise=True)
         else:
+            log_debug(f'[WiFi] Enterprise network "{ssid}" is not saved; requesting credentials from user')
             self.eap_dialog(network, wifi_card, False)
 
     def disconnect_wifi(self, _widget, wifi_card):
@@ -772,6 +789,7 @@ class TrayIcon:
             wifi_card (str): wireless interface name.
         """
         ssid = wifi_card
+        log_info(f'[WiFi] Disconnecting wireless interface {wifi_card}')
         if self.cardinfo and wifi_card in self.cardinfo.get('cards', {}):
             ssid = (
                 self.cardinfo['cards'][wifi_card]['state'].get('ssid')
@@ -832,12 +850,15 @@ class TrayIcon:
             _widget (Gtk.Widget): the menu item, unused.
             wg_device (str): the tunnel's configuration name, without .conf.
         """
+        log_info(f'[Tray] User requested connection to WireGuard tunnel "{wg_device}"')
         if not is_wireguard_installed():
+            log_error(f'[WireGuard] Required WireGuard packages not installed')
             show_wireguard_not_installed_alert()
             return
         ok, err_msg = enable_wg(wg_device)
         self.update_info()
         if not ok:
+            log_error(f'[WireGuard] Failed to connect to "{wg_device}": {err_msg}')
             if err_msg == WIREGUARD_NOT_INSTALLED_MSG:
                 show_wireguard_not_installed_alert()
                 return
@@ -849,6 +870,7 @@ class TrayIcon:
             dialog.run()
             dialog.destroy()
             return
+        log_info(f'[WireGuard] Tunnel "{wg_device}" is up and running')
         show_connection_notification(wg_device, True)
 
     def disconnect_wg(self, _widget, wg_device):
@@ -858,17 +880,21 @@ class TrayIcon:
             _widget (Gtk.Widget): the menu item, unused.
             wg_device (str): the tunnel's configuration name, without .conf.
         """
+        log_info(f'[Tray] User requested disconnection of WireGuard tunnel "{wg_device}"')
         disable_wg(wg_device)
         self.update_info()
         show_connection_notification(wg_device, False)
 
     def connect_openvpn(self, _widget, ovpn_dev, ovpn_meta):
         """Bring an OpenVPN tunnel up, prompting for credentials if required."""
+        display_name = ovpn_meta.get('info', ovpn_dev)
+        log_info(f'[Tray] User requested connection to OpenVPN profile "{display_name}" ({ovpn_dev})')
         if not is_openvpn_installed():
+            log_error(f'[OpenVPN] Required OpenVPN packages not installed')
             show_openvpn_not_installed_alert()
             return
-        display_name = ovpn_meta.get('info', ovpn_dev)
         if ovpn_meta.get('needs_auth'):
+            log_debug(f'[OpenVPN] Profile requires credentials; prompting user via dialog')
             dialog = OpenVPNAuthDialog(
                 ovpn_dev,
                 display_name,
@@ -884,12 +910,15 @@ class TrayIcon:
     def _do_connect_openvpn(self, ovpn_dev, username, password, display_name=None):
         """Start OpenVPN and report any startup failure."""
         if not is_openvpn_installed():
+            log_error(f'[OpenVPN] Required OpenVPN packages not installed')
             show_openvpn_not_installed_alert()
             return
         label_name = display_name or ovpn_dev
+        log_info(f'[OpenVPN] Connecting to "{label_name}" (profile_id={ovpn_dev})...')
         ok, err_msg = enable_openvpn(ovpn_dev, username=username, password=password)
         self.update_info()
         if not ok:
+            log_error(f'[OpenVPN] Connection to "{label_name}" failed: {err_msg}')
             if err_msg == OPENVPN_NOT_INSTALLED_MSG:
                 show_openvpn_not_installed_alert()
                 return
@@ -901,13 +930,16 @@ class TrayIcon:
             dialog.run()
             dialog.destroy()
             return
+        log_info(f'[OpenVPN] Tunnel "{label_name}" connected successfully')
         show_connection_notification(label_name, True)
 
     def disconnect_openvpn(self, _widget, ovpn_dev, display_name=None):
         """Take an OpenVPN tunnel down."""
+        label_name = display_name or ovpn_dev
+        log_info(f'[Tray] User requested disconnection of OpenVPN tunnel "{label_name}"')
         disable_openvpn(ovpn_dev)
         self.update_info()
-        show_connection_notification(display_name or ovpn_dev, False)
+        show_connection_notification(label_name, False)
 
     def import_vpn_configuration(self, _widget):
         """Open the VPN file importer dialog from the tray menu."""
@@ -948,12 +980,15 @@ class TrayIcon:
         """Bring an IPsec (IKEv2/IKEv1) or L2TP/IPsec tunnel up."""
         protocol = ipsec_meta.get('protocol', 'l2tp-ipsec')
         display_name = ipsec_meta.get('info', ipsec_dev)
+        log_info(f'[Tray] User requested connection to IPsec profile "{display_name}" ({ipsec_dev}, protocol={protocol})')
         if not is_ipsec_installed(protocol):
+            log_error(f'[IPsec] Required IPsec packages not installed for {protocol}')
             show_ipsec_not_installed_alert(protocol)
             return
         ok, err_msg = enable_ipsec(ipsec_dev)
         self.update_info()
         if not ok:
+            log_error(f'[IPsec] Connection to "{display_name}" failed: {err_msg}')
             dialog = Gtk.MessageDialog(
                 None, 0, Gtk.MessageType.WARNING, Gtk.ButtonsType.CLOSE,
                 _("Could not connect to %s") % display_name
@@ -962,13 +997,16 @@ class TrayIcon:
             dialog.run()
             dialog.destroy()
             return
+        log_info(f'[IPsec] IPsec profile "{display_name}" connected successfully')
         show_connection_notification(display_name, True)
 
     def disconnect_ipsec(self, _widget, ipsec_dev, display_name=None):
         """Take an IPsec or L2TP/IPsec tunnel down."""
+        label_name = display_name or ipsec_dev
+        log_info(f'[Tray] User requested disconnection of IPsec profile "{label_name}"')
         disable_ipsec(ipsec_dev)
         self.update_info()
-        show_connection_notification(display_name or ipsec_dev, False)
+        show_connection_notification(label_name, False)
 
     def configure_ipsec_profile(self, _widget, ipsec_path):
         """Open the VPN editor for an existing IPsec or L2TP/IPsec configuration."""
@@ -1209,24 +1247,30 @@ class TrayIcon:
             card (str): the interface to connect.
             enterprise (bool): True to reopen the EAP dialog on refusal.
         """
+        log_info(f'[WiFi] Starting association attempt to "{ssid}" on interface {card}')
         GLib.idle_add(self.start_icon_animation)
         try:
             if not connect_to_ssid(ssid, card):
+                log_error(f'[WiFi] Daemon rejected selection of "{ssid}" on {card}')
                 GLib.idle_add(self.connection_failed, ssid, card)
                 return
+            log_debug(f'[WiFi] Selected network "{ssid}"; waiting up to 30s for association and DHCP...')
             if wait_for_connection(card, ssid):
                 # It works, so now it is worth keeping. Until this point the
                 # network existed only in the daemon.
+                log_info(f'[WiFi] Successfully connected and associated with "{ssid}" on {card}')
                 wpa_save_config(card)
                 GLib.idle_add(show_connection_notification, ssid, True)
             else:
                 self.connect_attempts += 1
+                log_warning(f'[WiFi] Connection attempt {self.connect_attempts}/{MAX_ATTEMPTS} to "{ssid}" timed out or failed')
                 if network is not None and self.connect_attempts < MAX_ATTEMPTS:
                     GLib.idle_add(self.reopen_credentials_dialog, network, card,
                                   enterprise)
                 else:
                     # Out of tries, or an open network with nothing to
                     # retype. Either way the block does not work, so it goes.
+                    log_error(f'[WiFi] Max attempts exceeded; forgetting network "{ssid}" on {card}')
                     forget_network(ssid, card)
                     GLib.idle_add(self.connection_failed, ssid, card, True)
         finally:

@@ -23,6 +23,8 @@ from platform import system
 from subprocess import DEVNULL, PIPE, run
 from time import sleep
 
+from NetworkMgr.logger import log_debug, log_info, log_warning, log_error
+
 PREFIX = '/usr/local' if system() in ('FreeBSD', 'MidnightBSD', 'DragonFly') else sys.prefix
 OPENVPN_CONFIG_PATH = f'{PREFIX}/etc/openvpn/'
 OPENVPN_CERTS_PATH = f'{PREFIX}/etc/openvpn/certs/'
@@ -1583,6 +1585,7 @@ def enable_openvpn(profile_id, username=None, password=None, key_password=None, 
     """
     openvpn_bin = _openvpn_binary()
     if openvpn_bin is None:
+        log_error(f'[OpenVPN] Binary not found. {OPENVPN_NOT_INSTALLED_MSG}')
         return False, OPENVPN_NOT_INSTALLED_MSG
 
     conf_path = None
@@ -1593,11 +1596,14 @@ def enable_openvpn(profile_id, username=None, password=None, key_password=None, 
             break
 
     if not conf_path:
+        log_error(f'[OpenVPN] Configuration for "{profile_id}" was not found in {OPENVPN_CONFIG_PATH}')
         return False, f'Configuration for "{profile_id}" was not found.'
 
+    log_info(f'[OpenVPN] Starting OpenVPN tunnel "{profile_id}" (config={conf_path})')
     _sanitize_conf_file_routes(conf_path)
 
     if openvpn_status(profile_id) == 'Connected':
+        log_info(f'[OpenVPN] Tunnel "{profile_id}" is already connected')
         return True, ''
 
     _ensure_tun_module()
@@ -1652,16 +1658,21 @@ def enable_openvpn(profile_id, username=None, password=None, key_password=None, 
             _write_secure_file(tmp_askpass, key_password, 0o600)
             cmd.extend(['--askpass', tmp_askpass])
 
+        safe_cmd = [arg if not ('auth_' in arg or 'askpass_' in arg) else '<credentials-file>' for arg in cmd]
+        log_debug(f'[OpenVPN] Launching daemon: {" ".join(safe_cmd)}')
         try:
             result = run(cmd, stdout=PIPE, stderr=PIPE, check=False, text=True)
         except FileNotFoundError:
+            log_error(f'[OpenVPN] Executable not found: {openvpn_bin}')
             return False, OPENVPN_NOT_INSTALLED_MSG
         except OSError as exc:
+            log_error(f'[OpenVPN] Failed to execute OpenVPN: {exc}')
             return False, f'Failed to execute OpenVPN: {exc}'
         if result.returncode != 0:
             err = (result.stderr or result.stdout or '').strip()
             if not err and os.path.isfile(log_file):
                 err = _extract_openvpn_log_error(log_file)
+            log_error(f'[OpenVPN] Daemon failed to start (rc={result.returncode}): {err}')
             return False, err or 'OpenVPN failed to start.'
 
         # Poll the daemon log to verify the tunnel actually finishes initialization
@@ -1670,7 +1681,8 @@ def enable_openvpn(profile_id, username=None, password=None, key_password=None, 
         connected = False
         last_error = ''
 
-        for _ in range(max_attempts):
+        log_debug(f'[OpenVPN] Monitoring tunnel initialization (timeout={timeout}s)...')
+        for attempt in range(max_attempts):
             sleep(step)
             pid = _profile_pid(profile_id)
             if pid is None:
@@ -1678,6 +1690,7 @@ def enable_openvpn(profile_id, username=None, password=None, key_password=None, 
                     _extract_openvpn_log_error(log_file)
                     or 'OpenVPN process exited unexpectedly.'
                 )
+                log_error(f'[OpenVPN] Daemon exited unexpectedly: {last_error}')
                 break
 
             log_content = ''
@@ -1691,11 +1704,13 @@ def enable_openvpn(profile_id, username=None, password=None, key_password=None, 
             if log_content:
                 if 'Initialization Sequence Completed' in log_content:
                     connected = True
+                    log_info(f'[OpenVPN] Tunnel "{profile_id}" successfully connected (Initialization Sequence Completed, PID={pid})')
                     break
 
                 detected_err = _extract_openvpn_error_from_text(log_content)
                 if detected_err:
                     last_error = detected_err
+                    log_error(f'[OpenVPN] Fatal error detected in log: {detected_err}')
                     disable_openvpn(profile_id)
                     break
 
@@ -1707,6 +1722,7 @@ def enable_openvpn(profile_id, username=None, password=None, key_password=None, 
                     _extract_openvpn_log_error(log_file)
                     or 'Connection timed out waiting for OpenVPN tunnel to initialize.'
                 )
+            log_error(f'[OpenVPN] Connection failed: {last_error}')
             return False, last_error
 
         return True, ''
@@ -1725,8 +1741,10 @@ def disable_openvpn(profile_id):
     Args:
         profile_id (str): the profile identifier without extension.
     """
+    log_info(f'[OpenVPN] Disconnecting tunnel "{profile_id}"...')
     pid = _profile_pid(profile_id)
     if pid is not None:
+        log_debug(f'[OpenVPN] Sending SIGTERM to PID {pid}...')
         try:
             os.kill(pid, signal.SIGTERM)
         except OSError:

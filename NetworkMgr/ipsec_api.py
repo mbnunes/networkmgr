@@ -18,6 +18,8 @@ import tempfile
 from subprocess import DEVNULL, PIPE, Popen, TimeoutExpired, run
 from time import sleep
 
+from NetworkMgr.logger import log_debug, log_info, log_warning, log_error
+
 IPSEC_DIR = '/usr/local/etc/networkmgr/ipsec'
 STRONGSWAN_CONF_DIR = '/usr/local/etc/ipsec.d'
 STRONGSWAN_MAIN_CONF = '/usr/local/etc/ipsec.conf'
@@ -1034,44 +1036,61 @@ def enable_ipsec(profile_id, target_dir=IPSEC_DIR):
     profile_id = sanitize_ipsec_id(profile_id)
     conf_path = os.path.join(target_dir, f'{profile_id}.conf')
     if not os.path.isfile(conf_path):
+        log_error(f'[IPsec] Configuration file not found: {conf_path}')
         return False, f'Configuration not found: {conf_path}'
 
     try:
         cfg = parse_ipsec_config(conf_path)
     except ValueError as err:
+        log_error(f'[IPsec] Failed to parse config {conf_path}: {err}')
         return False, str(err)
 
     protocol = cfg.get('protocol', 'l2tp-ipsec')
+    gateway = cfg.get('gateway', '')
+    log_info(f'[IPsec] Initiating connection for "{profile_id}" (protocol={protocol}, gateway={gateway})')
+
     if not is_ipsec_installed(protocol):
-        return False, ipsec_missing_packages_message(protocol)
+        msg = ipsec_missing_packages_message(protocol)
+        log_error(f'[IPsec] Missing required packages: {msg}')
+        return False, msg
 
     os.makedirs(RUN_DIR, exist_ok=True)
     _write_strongswan_files(profile_id, cfg)
+    log_debug(f'[IPsec] StrongSwan configuration files generated for "{profile_id}"')
 
     ipsec_bin = _strongswan_binary()
     try:
         # Ensure strongSwan charon/starter is running and reload configs
         status_rc, _ = _run_daemon_cmd([ipsec_bin, 'status'], timeout=5)
         if status_rc != 0:
+            log_debug(f'[IPsec] StrongSwan daemon not running; executing {ipsec_bin} start...')
             _run_daemon_cmd([ipsec_bin, 'start'], timeout=10)
             sleep(1.0)
         else:
+            log_debug(f'[IPsec] Reloading StrongSwan secrets and connections...')
             _run_daemon_cmd([ipsec_bin, 'reload'], timeout=5)
             _run_daemon_cmd([ipsec_bin, 'rereadsecrets'], timeout=5)
             sleep(0.4)
 
+        log_debug(f'[IPsec] Establishing IPsec SA: {ipsec_bin} up nm-{profile_id}...')
         up_rc, output_text = _run_daemon_cmd(
             [ipsec_bin, 'up', f'nm-{profile_id}'],
             timeout=20,
         )
+        log_debug(f'[IPsec] StrongSwan up output (rc={up_rc}):\n{output_text}')
         if up_rc != 0 and 'established' not in output_text.lower():
-            return False, (output_text.strip() or 'StrongSwan failed to establish IPsec SA.')
+            err_msg = output_text.strip() or 'StrongSwan failed to establish IPsec SA.'
+            log_error(f'[IPsec] StrongSwan SA failed: {err_msg}')
+            return False, err_msg
+        log_info(f'[IPsec] StrongSwan IPsec SA established successfully')
     except OSError as exc:
+        log_error(f'[IPsec] OS error invoking StrongSwan: {exc}')
         return False, str(exc)
 
     if protocol == 'l2tp-ipsec':
         mpd_bin = _mpd5_binary()
         mpd_dir = _write_mpd5_config(profile_id, cfg)
+        log_debug(f'[IPsec] Generated mpd5 configuration in {mpd_dir}/mpd.conf')
         pid_file = os.path.join(RUN_DIR, f'{profile_id}.pid')
         state_file = os.path.join(RUN_DIR, f'{profile_id}.state')
 
@@ -1084,6 +1103,7 @@ def enable_ipsec(profile_id, target_dir=IPSEC_DIR):
                     pass
 
         ident = f'networkmgr_{profile_id}'
+        log_debug(f'[IPsec] Launching mpd5 daemon: {mpd_bin} -b -d {mpd_dir} -p {pid_file} -s {ident} l2tp_client')
         try:
             mpd_rc, err = _run_daemon_cmd(
                 [
@@ -1098,12 +1118,16 @@ def enable_ipsec(profile_id, target_dir=IPSEC_DIR):
             )
             if mpd_rc not in (0, None):
                 disable_ipsec(profile_id)
-                return False, (err or 'mpd5 failed to start L2TP session.').strip()
+                err_msg = (err or 'mpd5 failed to start L2TP session.').strip()
+                log_error(f'[IPsec] mpd5 start error: {err_msg}')
+                return False, err_msg
         except Exception as exc:
             disable_ipsec(profile_id)
+            log_error(f'[IPsec] Exception spawning mpd5: {exc}')
             return False, str(exc)
 
         # Monitor mpd5: wait for PID file and confirm process starts
+        log_debug(f'[IPsec] Monitoring mpd5 PID file and process table...')
         mpd_running = False
         mpd_pid = None
         for _ in range(30):  # up to 3 seconds (30 * 0.1s)
@@ -1121,9 +1145,11 @@ def enable_ipsec(profile_id, target_dir=IPSEC_DIR):
 
         if not mpd_running:
             err_msg = _extract_recent_mpd_error(ident) or 'mpd5 failed to start or write PID.'
+            log_error(f'[IPsec] mpd5 did not start cleanly: {err_msg}')
             disable_ipsec(profile_id)
             return False, err_msg
 
+        log_debug(f'[IPsec] mpd5 running with PID {mpd_pid}. Verifying PPP negotiation stability...')
         # Continue checking for 2 more seconds to ensure PPP negotiation does not immediately drop
         for _ in range(20):  # 2.0s
             sleep(0.1)
@@ -1132,8 +1158,11 @@ def enable_ipsec(profile_id, target_dir=IPSEC_DIR):
                     _extract_recent_mpd_error(ident)
                     or 'mpd5 L2TP session closed unexpectedly. Verify user credentials, IPsec PSK, and PPP auth settings.'
                 )
+                log_error(f'[IPsec] mpd5 died during PPP handshake: {err_msg}')
                 disable_ipsec(profile_id)
                 return False, err_msg
+
+        log_info(f'[IPsec] mpd5 L2TP session established and stable (PID={mpd_pid})')
 
     state_file = os.path.join(RUN_DIR, f'{profile_id}.state')
     try:
@@ -1142,19 +1171,23 @@ def enable_ipsec(profile_id, target_dir=IPSEC_DIR):
     except OSError:
         pass
 
+    log_debug(f'[IPsec] Applying static routes if configured...')
     _apply_custom_routes(cfg)
+    log_info(f'[IPsec] Connection "{profile_id}" successfully established')
     return True, ''
 
 
 def disable_ipsec(profile_id):
     """Stop an active IPsec or L2TP/IPsec connection."""
     profile_id = sanitize_ipsec_id(profile_id)
+    log_info(f'[IPsec] Disconnecting IPsec/L2TP connection "{profile_id}"...')
     pid_file = os.path.join(RUN_DIR, f'{profile_id}.pid')
     if os.path.isfile(pid_file):
         try:
             with open(pid_file, 'r', encoding='utf-8') as fh:
                 pid_str = fh.read().strip()
             if pid_str.isdigit() and _pid_is_mpd5(int(pid_str)):
+                log_debug(f'[IPsec] Terminating mpd5 process (PID={pid_str})...')
                 run(['kill', '-TERM', pid_str], stdout=PIPE, stderr=PIPE, check=False)
         except OSError:
             pass
@@ -1166,6 +1199,7 @@ def disable_ipsec(profile_id):
     ipsec_bin = _strongswan_binary()
     if ipsec_bin:
         try:
+            log_debug(f'[IPsec] Bringing down StrongSwan SA: {ipsec_bin} down nm-{profile_id}...')
             run(
                 [ipsec_bin, 'down', f'nm-{profile_id}'],
                 stdout=PIPE,
@@ -1181,3 +1215,4 @@ def disable_ipsec(profile_id):
             os.remove(state_file)
         except OSError:
             pass
+    log_info(f'[IPsec] Connection "{profile_id}" is disconnected')

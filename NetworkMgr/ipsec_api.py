@@ -101,19 +101,49 @@ def _pid_is_mpd5(pid):
 
 
 def _strongswan_binary():
-    """Locate the StrongSwan `ipsec` control binary on FreeBSD/GhostBSD."""
-    for candidate in ('/usr/local/sbin/ipsec', '/usr/sbin/ipsec'):
+    """Locate the StrongSwan `ipsec`, `strongswan`, or `swanctl` binary on FreeBSD/GhostBSD."""
+    for candidate in (
+        '/usr/local/sbin/ipsec',
+        '/usr/local/bin/ipsec',
+        '/usr/sbin/ipsec',
+        '/usr/bin/ipsec',
+        '/usr/local/sbin/strongswan',
+        '/usr/local/bin/strongswan',
+        '/usr/sbin/strongswan',
+        '/usr/bin/strongswan',
+        '/usr/local/sbin/swanctl',
+        '/usr/local/bin/swanctl',
+        '/usr/sbin/swanctl',
+        '/usr/bin/swanctl',
+    ):
         if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
             return candidate
-    return shutil.which('ipsec')
+    for name in ('ipsec', 'strongswan', 'swanctl'):
+        found = shutil.which(name)
+        if found:
+            return found
+    return None
 
 
 def _mpd5_binary():
     """Locate the FreeBSD `mpd5` Netgraph PPP/L2TP daemon binary."""
-    for candidate in ('/usr/local/sbin/mpd5', '/usr/sbin/mpd5'):
+    for candidate in (
+        '/usr/local/sbin/mpd5',
+        '/usr/local/bin/mpd5',
+        '/usr/sbin/mpd5',
+        '/usr/bin/mpd5',
+        '/usr/local/sbin/mpd',
+        '/usr/local/bin/mpd',
+        '/usr/sbin/mpd',
+        '/usr/bin/mpd',
+    ):
         if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
             return candidate
-    return shutil.which('mpd5')
+    for name in ('mpd5', 'mpd'):
+        found = shutil.which(name)
+        if found:
+            return found
+    return None
 
 
 def is_ipsec_installed(protocol='ikev2-eap'):

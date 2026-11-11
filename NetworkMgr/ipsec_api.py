@@ -758,7 +758,7 @@ def _write_strongswan_files(profile_id, cfg):
             '    keyexchange=ikev1',
             '    authby=secret',
             '    type=transport',
-            '    leftprotoport=17/%any',
+            f'    leftprotoport=17/{port}',
             f'    rightprotoport=17/{port}',
             '    rekey=no',
         ])
@@ -910,7 +910,7 @@ def _write_swanctl_config(profile_id, cfg):
             f'            nm-{profile_id} {{',
             '                mode = transport',
             f'                esp_proposals = {esp}',
-            '                local_ts = dynamic[udp]',
+            f'                local_ts = dynamic[udp/{port}]',
             f'                remote_ts = dynamic[udp/{port}]',
             '                dpd_action = clear',
             '                start_action = none',
@@ -1240,7 +1240,7 @@ def _write_mpd5_config(profile_id, cfg):
 
     mpd_conf = '\n'.join([
         'startup:',
-        '    log +ipcp +auth +link +bundle',
+        '    log +all -echo',
         '',
         'default:',
         '    load l2tp_client',
@@ -1260,6 +1260,7 @@ def _write_mpd5_config(profile_id, cfg):
         *auth_lines,
         f'    set auth authname "{full_user}"',
         f'    set auth password "{password}"',
+        f'    set l2tp self 0.0.0.0 {port}',
         f'    set l2tp peer {gateway} {port}',
         '    open',
         '',
@@ -1282,12 +1283,14 @@ def _extract_recent_mpd_error(ident):
         if os.path.isfile(log_path):
             try:
                 with open(log_path, 'r', encoding='utf-8', errors='replace') as fh:
-                    lines = fh.readlines()[-60:]
+                    lines = fh.readlines()[-80:]
                 matched = [
                     l.strip()
                     for l in lines
                     if (ident in l or 'mpd' in l.lower())
                 ]
+                if matched:
+                    log_debug('[IPsec] Recent mpd daemon logs:\n  ' + '\n  '.join(matched[-10:]))
                 for l in reversed(matched):
                     lower = l.lower()
                     if any(

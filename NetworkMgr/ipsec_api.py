@@ -14,6 +14,7 @@ import json
 import os
 import re
 import shutil
+import socket
 import tempfile
 from subprocess import DEVNULL, PIPE, Popen, TimeoutExpired, run
 from time import sleep
@@ -609,12 +610,18 @@ def ipsec_is_connected(profile_id):
             with open(pid_file, 'r', encoding='utf-8') as fh:
                 pid = int(fh.read().strip())
             alive = _pid_is_mpd5(pid)
-            if not alive and os.path.isfile(state_file):
-                try:
-                    os.remove(state_file)
-                except OSError:
-                    pass
-            return alive
+            if not alive:
+                if os.path.isfile(state_file):
+                    try:
+                        os.remove(state_file)
+                    except OSError:
+                        pass
+                return False
+            # For mpd5 L2TP, verify that up.info exists (interface is UP and has IP assigned)
+            info_file = os.path.join(RUN_DIR, profile_id, 'up.info')
+            if not os.path.isfile(info_file):
+                return False
+            return True
         except (ValueError, OSError):
             return False
     ipsec_bin = _strongswan_binary()
@@ -1156,9 +1163,11 @@ def _write_mpd5_config(profile_id, cfg):
     _write_secure_ipsec_file(up_script, up_sh_content, 0o755)
 
     # Create down.sh script
+    state_file = os.path.join(RUN_DIR, f'{profile_id}.state')
     down_sh_content = '\n'.join([
         '#!/bin/sh',
         f'rm -f "{info_file}"',
+        f'rm -f "{state_file}"',
         'exit 0',
         '',
     ])
@@ -1313,6 +1322,44 @@ def _extract_recent_mpd_error(ident):
     return ''
 
 
+def _get_physical_default_gateway():
+    """Find the current physical IPv4 default gateway IP and interface from netstat."""
+    for args in (['netstat', '-rn', '-f', 'inet'], ['netstat', '-rn']):
+        try:
+            res = run(args, stdout=PIPE, stderr=PIPE, universal_newlines=True, check=False)
+            if res.returncode == 0 and res.stdout:
+                for line in res.stdout.splitlines():
+                    parts = line.split()
+                    if not parts:
+                        continue
+                    if parts[0] in ('default', '0.0.0.0'):
+                        if len(parts) >= 2 and parts[1] not in ('default', '0.0.0.0'):
+                            gw = parts[1]
+                            iface = parts[3] if len(parts) > 3 and parts[2].startswith('UG') and not parts[3].startswith('UG') else parts[-1]
+                            return gw, iface
+        except OSError:
+            pass
+    return None, None
+
+
+def _resolve_ipv4(host):
+    """Resolve a hostname or IP string to an IPv4 address string."""
+    clean_host = _clean_line(host)
+    if not clean_host:
+        return ''
+    try:
+        return str(IPv4Address(clean_host))
+    except ValueError:
+        pass
+    try:
+        infos = socket.getaddrinfo(clean_host, None, socket.AF_INET)
+        if infos:
+            return infos[0][4][0]
+    except (socket.gaierror, OSError):
+        pass
+    return ''
+
+
 def _apply_custom_routes(cfg, fallback_gw=''):
     """Apply validated static IPv4/IPv6 routes configured on the profile."""
     for rt in cfg.get('ipv4_routes') or []:
@@ -1321,14 +1368,10 @@ def _apply_custom_routes(cfg, fallback_gw=''):
         gw = _clean_line(rt.get('gateway') or cfg.get('ipv4_gateway') or fallback_gw or '')
         if addr and mask and gw:
             try:
-                addr_ok = str(IPv4Address(addr))
                 gw_ok = str(IPv4Address(gw))
-                if mask.isdigit() and 0 <= int(mask) <= 32:
-                    mask_ok = str(IPv4Network(f'0.0.0.0/{mask}').netmask)
-                else:
-                    mask_ok = str(IPv4Address(mask))
+                net_obj = IPv4Network(f'{addr}/{mask}', strict=False)
                 run(
-                    ['route', '-n', 'add', '-net', addr_ok, gw_ok, mask_ok],
+                    ['route', '-n', 'add', '-net', net_obj.with_prefixlen, gw_ok],
                     stdout=PIPE,
                     stderr=PIPE,
                     check=False,
@@ -1350,6 +1393,47 @@ def _apply_custom_routes(cfg, fallback_gw=''):
                     gw6_ok = gw6_ip
                 run(
                     ['route', '-n', 'add', '-inet6', net6_ok, gw6_ok],
+                    stdout=PIPE,
+                    stderr=PIPE,
+                    check=False,
+                )
+            except (ValueError, OSError):
+                pass
+
+
+def _remove_custom_routes(cfg, fallback_gw=''):
+    """Remove static IPv4/IPv6 routes on disconnect."""
+    for rt in cfg.get('ipv4_routes') or []:
+        addr = _clean_line(rt.get('address') or '')
+        mask = _clean_line(rt.get('netmask') or '')
+        gw = _clean_line(rt.get('gateway') or cfg.get('ipv4_gateway') or fallback_gw or '')
+        if addr and mask and gw:
+            try:
+                gw_ok = str(IPv4Address(gw))
+                net_obj = IPv4Network(f'{addr}/{mask}', strict=False)
+                run(
+                    ['route', '-n', 'delete', '-net', net_obj.with_prefixlen, gw_ok],
+                    stdout=PIPE,
+                    stderr=PIPE,
+                    check=False,
+                )
+            except (ValueError, OSError):
+                pass
+    for rt6 in cfg.get('ipv6_routes') or []:
+        addr6 = _clean_line(rt6.get('address') or '')
+        plen = _clean_line(rt6.get('prefixlen') or '64').lstrip('/')
+        gw6 = _clean_line(rt6.get('gateway') or cfg.get('ipv6_gateway') or '')
+        if addr6 and gw6:
+            try:
+                net6_ok = str(IPv6Network(f'{addr6}/{plen}', strict=False))
+                gw6_parts = gw6.split('%', 1)
+                gw6_ip = str(IPv6Address(gw6_parts[0]))
+                if len(gw6_parts) == 2 and re.fullmatch(r'[A-Za-z0-9_.-]+', gw6_parts[1]):
+                    gw6_ok = f'{gw6_ip}%{gw6_parts[1]}'
+                else:
+                    gw6_ok = gw6_ip
+                run(
+                    ['route', '-n', 'delete', '-inet6', net6_ok, gw6_ok],
                     stdout=PIPE,
                     stderr=PIPE,
                     check=False,
@@ -1406,6 +1490,23 @@ def enable_ipsec(profile_id, target_dir=IPSEC_DIR):
         return False, msg
 
     os.makedirs(RUN_DIR, exist_ok=True)
+
+    # Pin the VPN gateway host route to the physical default gateway so that
+    # any VPN routes (default route 0.0.0.0/0 or subnets covering the server)
+    # never hijack the outer tunnel packets (UDP 500/4500/1701).
+    gw_host = cfg.get('gateway', '')
+    gw_ip = _resolve_ipv4(gw_host)
+    phys_gw, _ = _get_physical_default_gateway()
+    if gw_ip and phys_gw and gw_ip != phys_gw:
+        log_debug(f'[IPsec] Pinning VPN gateway route: route -n add -host {gw_ip} {phys_gw}')
+        run(['route', '-n', 'add', '-host', gw_ip, phys_gw], stdout=PIPE, stderr=PIPE, check=False)
+        endpoint_file = os.path.join(RUN_DIR, f'{profile_id}.endpoint')
+        try:
+            with open(endpoint_file, 'w', encoding='utf-8') as fh:
+                fh.write(f'{gw_ip}\n{phys_gw}\n')
+        except OSError:
+            pass
+
     _write_strongswan_files(profile_id, cfg)
     log_debug(f'[IPsec] StrongSwan configuration files generated for "{profile_id}"')
 
@@ -1668,4 +1769,29 @@ def disable_ipsec(profile_id):
             os.remove(state_file)
         except OSError:
             pass
+
+    endpoint_file = os.path.join(RUN_DIR, f'{profile_id}.endpoint')
+    if os.path.isfile(endpoint_file):
+        try:
+            with open(endpoint_file, 'r', encoding='utf-8') as fh:
+                ep_lines = [l.strip() for l in fh.readlines() if l.strip()]
+            if len(ep_lines) >= 2:
+                gw_ip, phys_gw = ep_lines[0], ep_lines[1]
+                log_debug(f'[IPsec] Removing pinned VPN gateway route: route -n delete -host {gw_ip} {phys_gw}')
+                run(['route', '-n', 'delete', '-host', gw_ip, phys_gw], stdout=PIPE, stderr=PIPE, check=False)
+        except OSError:
+            pass
+        try:
+            os.remove(endpoint_file)
+        except OSError:
+            pass
+
+    conf_path = os.path.join(IPSEC_DIR, f'{profile_id}.conf')
+    if os.path.isfile(conf_path):
+        try:
+            cfg = parse_ipsec_config(conf_path)
+            _remove_custom_routes(cfg)
+        except Exception:
+            pass
+
     log_info(f'[IPsec] Connection "{profile_id}" is disconnected')

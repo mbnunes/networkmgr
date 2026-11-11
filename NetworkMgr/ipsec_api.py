@@ -758,7 +758,8 @@ def _write_strongswan_files(profile_id, cfg):
             '    keyexchange=ikev1',
             '    authby=secret',
             '    type=transport',
-            f'    leftprotoport=17/{port}',
+            '    forceencaps=yes',
+            '    leftprotoport=17/%any',
             f'    rightprotoport=17/{port}',
             '    rekey=no',
         ])
@@ -895,6 +896,7 @@ def _write_swanctl_config(profile_id, cfg):
             '        version = 1',
             f'        remote_addrs = {gateway}',
             f'        proposals = {ike}',
+            '        encap = yes',
             '        local {',
             '            auth = psk',
         ]
@@ -910,7 +912,7 @@ def _write_swanctl_config(profile_id, cfg):
             f'            nm-{profile_id} {{',
             '                mode = transport',
             f'                esp_proposals = {esp}',
-            f'                local_ts = dynamic[udp/{port}]',
+            '                local_ts = dynamic[udp]',
             f'                remote_ts = dynamic[udp/{port}]',
             '                dpd_action = clear',
             '                start_action = none',
@@ -1256,11 +1258,10 @@ def _write_mpd5_config(profile_id, cfg):
         '    set link action bundle B1',
         f'    set link mtu {mtu}',
         '    set link keep-alive 20 75',
-        '    set link max-redial 0',
+        '    set link max-redial -1',
         *auth_lines,
         f'    set auth authname "{full_user}"',
         f'    set auth password "{password}"',
-        f'    set l2tp self 0.0.0.0 {port}',
         f'    set l2tp peer {gateway} {port}',
         '    open',
         '',
@@ -1283,14 +1284,14 @@ def _extract_recent_mpd_error(ident):
         if os.path.isfile(log_path):
             try:
                 with open(log_path, 'r', encoding='utf-8', errors='replace') as fh:
-                    lines = fh.readlines()[-80:]
+                    lines = fh.readlines()[-300:]
                 matched = [
                     l.strip()
                     for l in lines
                     if (ident in l or 'mpd' in l.lower())
                 ]
                 if matched:
-                    log_debug('[IPsec] Recent mpd daemon logs:\n  ' + '\n  '.join(matched[-10:]))
+                    log_debug('[IPsec] Recent mpd daemon logs:\n  ' + '\n  '.join(matched[-25:]))
                 for l in reversed(matched):
                     lower = l.lower()
                     if any(
@@ -1306,6 +1307,7 @@ def _extract_recent_mpd_error(ident):
                             'no response',
                             'terminated',
                             'not converging',
+                            'address already in use',
                         )
                     ):
                         return l

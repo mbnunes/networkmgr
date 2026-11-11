@@ -593,7 +593,13 @@ def ipsec_is_connected(profile_id):
         try:
             with open(pid_file, 'r', encoding='utf-8') as fh:
                 pid = int(fh.read().strip())
-            return _pid_is_mpd5(pid)
+            alive = _pid_is_mpd5(pid)
+            if not alive and os.path.isfile(state_file):
+                try:
+                    os.remove(state_file)
+                except OSError:
+                    pass
+            return alive
         except (ValueError, OSError):
             return False
     ipsec_bin = _strongswan_binary()
@@ -728,7 +734,7 @@ def _write_strongswan_files(profile_id, cfg):
             '    keyexchange=ikev1',
             '    authby=secret',
             '    type=transport',
-            f'    leftprotoport=17/{port}',
+            '    leftprotoport=17/%any',
             f'    rightprotoport=17/{port}',
             '    rekey=no',
         ])
@@ -832,6 +838,7 @@ def _write_mpd5_config(profile_id, cfg):
     iface_lines = [
         '    set iface disable on-demand',
         '    set iface idle 0',
+        '    set iface enable tcpmssfix',
         f'    set iface mtu {mtu}',
     ]
     if cfg.get('default_route', True):
@@ -854,25 +861,34 @@ def _write_mpd5_config(profile_id, cfg):
         except ValueError:
             pass
 
-    accepted_auth = []
+    auth_lines = ['    set link no pap chap-md5 chap-msv1 chap-msv2 eap']
+    enabled_auth = []
     if cfg.get('ppp_mschapv2', True):
-        accepted_auth.append('chap-msv2')
+        enabled_auth.append('chap-msv2')
     if cfg.get('ppp_chap', True):
-        for proto in ('chap-md5', 'chap-msv1', 'chap-msv2'):
-            if proto not in accepted_auth:
-                accepted_auth.append(proto)
+        for proto in ('chap-md5', 'chap-msv1'):
+            if proto not in enabled_auth:
+                enabled_auth.append(proto)
     if cfg.get('ppp_pap', False):
-        accepted_auth.append('pap')
+        enabled_auth.append('pap')
 
-    auth_lines = []
-    if accepted_auth:
-        auth_lines.append(f'    set link accept {" ".join(accepted_auth)}')
+    for proto in enabled_auth:
+        auth_lines.append(f'    set link enable {proto}')
+        auth_lines.append(f'    set link accept {proto}')
 
-    ccp_lines = ['    set bundle enable compression', '    set ccp yes mppc']
+    ccp_lines = []
     if cfg.get('mppe_required', False):
-        ccp_lines.append('    set mppc yes e40 e128 stateless')
+        ccp_lines.extend([
+            '    set bundle enable compression',
+            '    set ccp yes mppc',
+            '    set mppc yes e40 e128 stateless',
+        ])
     else:
-        ccp_lines.append('    set mppc yes e40 e56 e128 stateless')
+        ccp_lines.extend([
+            '    set bundle accept compression',
+            '    set ccp accept mppc',
+            '    set mppc accept e40 e56 e128 stateless',
+        ])
 
     mpd_conf = '\n'.join([
         'startup:',
@@ -884,11 +900,13 @@ def _write_mpd5_config(profile_id, cfg):
         '    create bundle static B1',
         *iface_lines,
         '    set ipcp ranges ' + ipcp_range,
+        '    set ipcp enable req-pri-dns req-sec-dns',
         *ccp_lines,
         '    create link static L1 l2tp',
         '    set link action bundle B1',
         f'    set link mtu {mtu}',
         '    set link keep-alive 20 75',
+        '    set link max-redial 0',
         *auth_lines,
         f'    set auth authname "{full_user}"',
         f'    set auth password "{password}"',
@@ -900,6 +918,46 @@ def _write_mpd5_config(profile_id, cfg):
     mpd_path = os.path.join(mpd_dir, 'mpd.conf')
     _write_secure_ipsec_file(mpd_path, mpd_conf, 0o600)
     return mpd_dir
+
+
+def _extract_recent_mpd_error(ident):
+    """Scan syslog / mpd log files for recent error lines regarding this profile."""
+    log_candidates = (
+        '/var/log/mpd.log',
+        '/var/log/messages',
+        '/var/log/daemon.log',
+        '/var/log/syslog',
+    )
+    for log_path in log_candidates:
+        if os.path.isfile(log_path):
+            try:
+                with open(log_path, 'r', encoding='utf-8', errors='replace') as fh:
+                    lines = fh.readlines()[-60:]
+                matched = [
+                    l.strip()
+                    for l in lines
+                    if (ident in l or 'mpd' in l.lower())
+                ]
+                for l in reversed(matched):
+                    lower = l.lower()
+                    if any(
+                        term in lower
+                        for term in (
+                            'auth failed',
+                            'failed',
+                            'error',
+                            'rejected',
+                            'refused',
+                            'timed out',
+                            'denied',
+                            'no response',
+                            'terminated',
+                        )
+                    ):
+                        return l
+            except OSError:
+                pass
+    return ''
 
 
 def _apply_custom_routes(cfg):
@@ -1015,6 +1073,17 @@ def enable_ipsec(profile_id, target_dir=IPSEC_DIR):
         mpd_bin = _mpd5_binary()
         mpd_dir = _write_mpd5_config(profile_id, cfg)
         pid_file = os.path.join(RUN_DIR, f'{profile_id}.pid')
+        state_file = os.path.join(RUN_DIR, f'{profile_id}.state')
+
+        # Clean up stale pid / state files
+        for stale in (pid_file, state_file):
+            if os.path.exists(stale):
+                try:
+                    os.remove(stale)
+                except OSError:
+                    pass
+
+        ident = f'networkmgr_{profile_id}'
         try:
             mpd_rc, err = _run_daemon_cmd(
                 [
@@ -1022,15 +1091,49 @@ def enable_ipsec(profile_id, target_dir=IPSEC_DIR):
                     '-b',
                     '-d', mpd_dir,
                     '-p', pid_file,
-                    '-s', f'networkmgr_{profile_id}',
+                    '-s', ident,
                     'l2tp_client',
                 ],
                 timeout=10,
             )
             if mpd_rc not in (0, None):
+                disable_ipsec(profile_id)
                 return False, (err or 'mpd5 failed to start L2TP session.').strip()
         except Exception as exc:
+            disable_ipsec(profile_id)
             return False, str(exc)
+
+        # Monitor mpd5: wait for PID file and confirm process starts
+        mpd_running = False
+        mpd_pid = None
+        for _ in range(30):  # up to 3 seconds (30 * 0.1s)
+            sleep(0.1)
+            if os.path.isfile(pid_file):
+                try:
+                    with open(pid_file, 'r', encoding='utf-8') as fh:
+                        pid_val = int(fh.read().strip())
+                    if _pid_is_mpd5(pid_val):
+                        mpd_pid = pid_val
+                        mpd_running = True
+                        break
+                except (ValueError, OSError):
+                    pass
+
+        if not mpd_running:
+            err_msg = _extract_recent_mpd_error(ident) or 'mpd5 failed to start or write PID.'
+            disable_ipsec(profile_id)
+            return False, err_msg
+
+        # Continue checking for 2 more seconds to ensure PPP negotiation does not immediately drop
+        for _ in range(20):  # 2.0s
+            sleep(0.1)
+            if not _pid_is_mpd5(mpd_pid):
+                err_msg = (
+                    _extract_recent_mpd_error(ident)
+                    or 'mpd5 L2TP session closed unexpectedly. Verify user credentials, IPsec PSK, and PPP auth settings.'
+                )
+                disable_ipsec(profile_id)
+                return False, err_msg
 
     state_file = os.path.join(RUN_DIR, f'{profile_id}.state')
     try:

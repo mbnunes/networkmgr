@@ -1359,9 +1359,6 @@ def _extract_openvpn_error_from_text(content):
     match = re.search(r'RESOLVE:\s*Cannot resolve host address:\s*(\S+)', content)
     if match:
         return f'Could not resolve VPN server address: {match.group(1)}'
-    match = re.search(r'(Options error:[^\n]+)', content)
-    if match:
-        return _clean_openvpn_log_line(match.group(1))
     return ''
 
 
@@ -1380,21 +1377,16 @@ def _extract_openvpn_log_error(log_file):
     if known:
         return known
 
-    # Look backwards for lines reporting errors
+    # Look backwards for lines reporting errors, ignoring harmless push-options warnings
     for raw in reversed(lines):
         cleaned = _clean_openvpn_log_line(raw)
-        if not cleaned:
+        if not cleaned or '[push-options]' in cleaned.lower():
             continue
         lower = cleaned.lower()
         if any(tok in lower for tok in ('error', 'fatal', 'failed', 'cannot', 'sigterm', 'exit')):
             if not lower.startswith('note:') and 'suppress' not in lower:
                 return cleaned
 
-    # Fallback to last non-empty line
-    for raw in reversed(lines):
-        cleaned = _clean_openvpn_log_line(raw)
-        if cleaned:
-            return cleaned
     return ''
 
 
@@ -1448,7 +1440,6 @@ def openvpn_status(profile_id):
         'Connection reset',
         'Connection refused',
         'Fatal error',
-        'ERROR:',
     )
     if any(marker in after_init for marker in error_markers):
         return 'Connecting'
@@ -1698,14 +1689,14 @@ def enable_openvpn(profile_id, username=None, password=None, key_password=None, 
                     pass
 
             if log_content:
+                if 'Initialization Sequence Completed' in log_content:
+                    connected = True
+                    break
+
                 detected_err = _extract_openvpn_error_from_text(log_content)
                 if detected_err:
                     last_error = detected_err
                     disable_openvpn(profile_id)
-                    break
-
-                if 'Initialization Sequence Completed' in log_content:
-                    connected = True
                     break
 
         if not connected:

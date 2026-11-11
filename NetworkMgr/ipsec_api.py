@@ -1213,32 +1213,28 @@ def _write_mpd5_config(profile_id, cfg):
             pass
 
     auth_lines = ['    set link no pap chap-md5 chap-msv1 chap-msv2 eap']
-    enabled_auth = []
+    accepted_auth = []
     if cfg.get('ppp_mschapv2', True):
-        enabled_auth.append('chap-msv2')
+        accepted_auth.append('chap-msv2')
     if cfg.get('ppp_chap', True):
         for proto in ('chap-md5', 'chap-msv1'):
-            if proto not in enabled_auth:
-                enabled_auth.append(proto)
+            if proto not in accepted_auth:
+                accepted_auth.append(proto)
     if cfg.get('ppp_pap', False):
-        enabled_auth.append('pap')
+        accepted_auth.append('pap')
 
-    for proto in enabled_auth:
-        auth_lines.append(f'    set link enable {proto}')
+    if not accepted_auth:
+        accepted_auth.append('chap-msv2')
+
+    for proto in accepted_auth:
         auth_lines.append(f'    set link accept {proto}')
 
-    ccp_lines = []
-    if cfg.get('mppe_required', False):
-        ccp_lines.extend([
-            '    set bundle enable compression',
-            '    set ccp yes mppc',
-            '    set mppc yes e40 e128 stateless',
-        ])
-    else:
-        ccp_lines.extend([
-            '    set bundle disable compression',
-            '    set ccp disable mppc',
-        ])
+    ccp_lines = [
+        '    set bundle enable compression',
+        '    set bundle enable crypt-reqd' if cfg.get('mppe_required', False) else '    set bundle disable crypt-reqd',
+        '    set ccp yes mppc',
+        '    set mppc yes e40 e128 stateless',
+    ]
 
     mpd_conf = '\n'.join([
         'startup:',
@@ -1257,6 +1253,7 @@ def _write_mpd5_config(profile_id, cfg):
         '    create link static L1 l2tp',
         '    set link action bundle B1',
         f'    set link mtu {mtu}',
+        f'    set link mru {mtu}',
         '    set link keep-alive 20 75',
         '    set link max-redial -1',
         *auth_lines,
@@ -1543,10 +1540,10 @@ def enable_ipsec(profile_id, target_dir=IPSEC_DIR):
             disable_ipsec(profile_id)
             return False, err_msg
 
-        # Poll for link & IPCP address negotiation (up to 12 seconds)
+        # Poll for link & IPCP address negotiation (up to 20 seconds)
         log_debug(f'[IPsec] mpd5 running (PID={mpd_pid}). Waiting for IPCP address assignment...')
         acquired_ip = False
-        for _ in range(120):  # 12.0 seconds (120 * 0.1s)
+        for _ in range(200):  # 20.0 seconds (200 * 0.1s)
             sleep(0.1)
             if not _pid_is_mpd5(mpd_pid):
                 err_msg = (

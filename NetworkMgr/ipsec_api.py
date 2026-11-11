@@ -822,6 +822,34 @@ def _write_mpd5_config(profile_id, cfg):
     except OSError:
         pass
 
+    info_file = os.path.join(mpd_dir, 'up.info')
+    up_script = os.path.join(mpd_dir, 'up.sh')
+    down_script = os.path.join(mpd_dir, 'down.sh')
+
+    # Create up.sh script to capture interface, assigned local IP, and peer/gateway IP
+    up_sh_content = '\n'.join([
+        '#!/bin/sh',
+        f'echo "interface=$1" > "{info_file}"',
+        f'echo "proto=$2" >> "{info_file}"',
+        f'echo "local_ip=$3" >> "{info_file}"',
+        f'echo "remote_ip=$4" >> "{info_file}"',
+        f'echo "authname=$5" >> "{info_file}"',
+        f'echo "dns1=$6" >> "{info_file}"',
+        f'echo "dns2=$7" >> "{info_file}"',
+        'exit 0',
+        '',
+    ])
+    _write_secure_ipsec_file(up_script, up_sh_content, 0o755)
+
+    # Create down.sh script
+    down_sh_content = '\n'.join([
+        '#!/bin/sh',
+        f'rm -f "{info_file}"',
+        'exit 0',
+        '',
+    ])
+    _write_secure_ipsec_file(down_script, down_sh_content, 0o755)
+
     gateway = _clean_line(cfg.get('gateway', ''))
     if not SAFE_HOST_RE.fullmatch(gateway):
         raise ValueError(f'Invalid gateway address: "{gateway}"')
@@ -842,6 +870,8 @@ def _write_mpd5_config(profile_id, cfg):
         '    set iface idle 0',
         '    set iface enable tcpmssfix',
         f'    set iface mtu {mtu}',
+        f'    set iface up-script "{up_script}"',
+        f'    set iface down-script "{down_script}"',
     ]
     if cfg.get('default_route', True):
         iface_lines.append('    set iface route default')
@@ -859,7 +889,12 @@ def _write_mpd5_config(profile_id, cfg):
     if cfg.get('ipv4_method') == 'Manual' and cfg.get('ipv4_address'):
         try:
             addr4 = str(IPv4Address(_clean_line(cfg['ipv4_address'])))
-            ipcp_range = f'{addr4}/32 0.0.0.0/0'
+            gw4 = _clean_line(cfg.get('ipv4_gateway') or '')
+            if gw4:
+                gw4_ip = str(IPv4Address(gw4))
+                ipcp_range = f'{addr4}/32 {gw4_ip}/32'
+            else:
+                ipcp_range = f'{addr4}/32 0.0.0.0/0'
         except ValueError:
             pass
 
@@ -887,13 +922,13 @@ def _write_mpd5_config(profile_id, cfg):
         ])
     else:
         ccp_lines.extend([
-            '    set bundle accept compression',
-            '    set ccp accept mppc',
-            '    set mppc accept e40 e56 e128 stateless',
+            '    set bundle disable compression',
+            '    set ccp disable mppc',
         ])
 
     mpd_conf = '\n'.join([
         'startup:',
+        '    log +ipcp +auth +link +bundle',
         '',
         'default:',
         '    load l2tp_client',
@@ -901,6 +936,7 @@ def _write_mpd5_config(profile_id, cfg):
         'l2tp_client:',
         '    create bundle static B1',
         *iface_lines,
+        '    set ipcp no vjcomp',
         '    set ipcp ranges ' + ipcp_range,
         '    set ipcp enable req-pri-dns req-sec-dns',
         *ccp_lines,
@@ -954,6 +990,7 @@ def _extract_recent_mpd_error(ident):
                             'denied',
                             'no response',
                             'terminated',
+                            'not converging',
                         )
                     ):
                         return l
@@ -962,12 +999,12 @@ def _extract_recent_mpd_error(ident):
     return ''
 
 
-def _apply_custom_routes(cfg):
+def _apply_custom_routes(cfg, fallback_gw=''):
     """Apply validated static IPv4/IPv6 routes configured on the profile."""
     for rt in cfg.get('ipv4_routes') or []:
         addr = _clean_line(rt.get('address') or '')
         mask = _clean_line(rt.get('netmask') or '')
-        gw = _clean_line(rt.get('gateway') or cfg.get('ipv4_gateway') or '')
+        gw = _clean_line(rt.get('gateway') or cfg.get('ipv4_gateway') or fallback_gw or '')
         if addr and mask and gw:
             try:
                 addr_ok = str(IPv4Address(addr))
@@ -1087,15 +1124,20 @@ def enable_ipsec(profile_id, target_dir=IPSEC_DIR):
         log_error(f'[IPsec] OS error invoking StrongSwan: {exc}')
         return False, str(exc)
 
+    assigned_iface = ''
+    assigned_ip = ''
+    remote_gw = ''
+
     if protocol == 'l2tp-ipsec':
         mpd_bin = _mpd5_binary()
         mpd_dir = _write_mpd5_config(profile_id, cfg)
         log_debug(f'[IPsec] Generated mpd5 configuration in {mpd_dir}/mpd.conf')
         pid_file = os.path.join(RUN_DIR, f'{profile_id}.pid')
         state_file = os.path.join(RUN_DIR, f'{profile_id}.state')
+        info_file = os.path.join(mpd_dir, 'up.info')
 
-        # Clean up stale pid / state files
-        for stale in (pid_file, state_file):
+        # Clean up stale pid / state / info files
+        for stale in (pid_file, state_file, info_file):
             if os.path.exists(stale):
                 try:
                     os.remove(stale)
@@ -1149,9 +1191,10 @@ def enable_ipsec(profile_id, target_dir=IPSEC_DIR):
             disable_ipsec(profile_id)
             return False, err_msg
 
-        log_debug(f'[IPsec] mpd5 running with PID {mpd_pid}. Verifying PPP negotiation stability...')
-        # Continue checking for 2 more seconds to ensure PPP negotiation does not immediately drop
-        for _ in range(20):  # 2.0s
+        # Poll for link & IPCP address negotiation (up to 12 seconds)
+        log_debug(f'[IPsec] mpd5 running (PID={mpd_pid}). Waiting for IPCP address assignment...')
+        acquired_ip = False
+        for _ in range(120):  # 12.0 seconds (120 * 0.1s)
             sleep(0.1)
             if not _pid_is_mpd5(mpd_pid):
                 err_msg = (
@@ -1162,17 +1205,61 @@ def enable_ipsec(profile_id, target_dir=IPSEC_DIR):
                 disable_ipsec(profile_id)
                 return False, err_msg
 
-        log_info(f'[IPsec] mpd5 L2TP session established and stable (PID={mpd_pid})')
+            if os.path.isfile(info_file):
+                try:
+                    with open(info_file, 'r', encoding='utf-8') as fh:
+                        info_content = fh.read()
+                    props = dict(line.split('=', 1) for line in info_content.splitlines() if '=' in line)
+                    assigned_iface = props.get('interface', '')
+                    assigned_ip = props.get('local_ip', '')
+                    remote_gw = props.get('remote_ip', '')
+                    if assigned_ip and assigned_ip != '0.0.0.0':
+                        acquired_ip = True
+                        break
+                except (OSError, ValueError):
+                    pass
+
+        if not acquired_ip:
+            # Fallback: check if an ng* interface has an assigned inet address
+            try:
+                if_res = run(['ifconfig'], stdout=PIPE, stderr=PIPE, universal_newlines=True, check=False)
+                for block in re.split(r'\n(?=[a-zA-Z0-9_]+:)', if_res.stdout or ''):
+                    if block.startswith('ng'):
+                        match = re.search(r'inet\s+(\d+\.\d+\.\d+\.\d+)\s+-->\s+(\d+\.\d+\.\d+\.\d+)', block)
+                        if match:
+                            assigned_ip = match.group(1)
+                            remote_gw = match.group(2)
+                            acquired_ip = True
+                            assigned_iface = block.split(':', 1)[0]
+                            break
+            except OSError:
+                pass
+
+        if not acquired_ip:
+            err_msg = (
+                _extract_recent_mpd_error(ident)
+                or 'mpd5 connected to L2TP server, but failed to acquire IPv4 address via IPCP. Verify server IP pool, DNS, and IPCP settings.'
+            )
+            log_error(f'[IPsec] IPCP negotiation failed: {err_msg}')
+            disable_ipsec(profile_id)
+            return False, err_msg
+
+        log_info(f'[IPsec] mpd5 L2TP session established: interface={assigned_iface}, local_ip={assigned_ip}, remote_gw={remote_gw} (PID={mpd_pid})')
 
     state_file = os.path.join(RUN_DIR, f'{profile_id}.state')
     try:
         with open(state_file, 'w', encoding='utf-8') as fh:
-            fh.write('connected\n')
+            fh.write(
+                f'connected\n'
+                f'interface={assigned_iface}\n'
+                f'ip={assigned_ip}\n'
+                f'gateway={remote_gw}\n'
+            )
     except OSError:
         pass
 
     log_debug(f'[IPsec] Applying static routes if configured...')
-    _apply_custom_routes(cfg)
+    _apply_custom_routes(cfg, fallback_gw=remote_gw)
     log_info(f'[IPsec] Connection "{profile_id}" successfully established')
     return True, ''
 
@@ -1181,6 +1268,14 @@ def disable_ipsec(profile_id):
     """Stop an active IPsec or L2TP/IPsec connection."""
     profile_id = sanitize_ipsec_id(profile_id)
     log_info(f'[IPsec] Disconnecting IPsec/L2TP connection "{profile_id}"...')
+    mpd_dir = os.path.join(RUN_DIR, profile_id)
+    info_file = os.path.join(mpd_dir, 'up.info')
+    if os.path.isfile(info_file):
+        try:
+            os.remove(info_file)
+        except OSError:
+            pass
+
     pid_file = os.path.join(RUN_DIR, f'{profile_id}.pid')
     if os.path.isfile(pid_file):
         try:
